@@ -17,18 +17,18 @@ sql_pwd = os.getenv("SQL_PASSWORD")
 org = os.getenv("SALESFORCE_ORG")
 sf_cli = os.getenv("SF_CLI", "sf.cmd")  # Default to sf.cmd on Windows
 
-# SQL Connection
+# SQL Connection (autocommit True for safety)
 cn = pyodbc.connect(
     f"DRIVER={sql_driver};"
     f"SERVER={sql_server};"
     f"DATABASE={sql_db};"
     f"UID={sql_user};"
-    f"PWD={sql_pwd}"
+    f"PWD={sql_pwd}",
+    autocommit=True
 )
 cur = cn.cursor()
 
-def ensure_table():
-    """Create SalesforceFields table if it does not exist"""
+def ensure_field_table():
     cur.execute("""
     IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SalesforceFields' AND xtype='U')
     CREATE TABLE SalesforceFields (
@@ -41,57 +41,76 @@ def ensure_table():
         PRIMARY KEY (ObjectName, FieldName)
     );
     """)
-    cn.commit()
+
+def run_sf_command(cmd_args):
+    result = subprocess.run(cmd_args, capture_output=True, text=True, shell=True)
+    if result.returncode != 0:
+        print(f"⚠️ CLI command failed: {' '.join(cmd_args)}")
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except Exception as e:
+        print("⚠️ Failed to parse JSON:", e)
+        print("Output was:", result.stdout[:500])
+        return {}
 
 def get_objects():
-    result = subprocess.run(
-        [sf_cli, "sobject", "list", "--json", "--target-org", org],
-        capture_output=True, text=True, shell=True
-    )
-    data = json.loads(result.stdout)
+    data = run_sf_command([sf_cli, "force", "schema", "sobject", "list", "--json", "--target-org", org])
     return data.get("result", [])
 
 def get_fields(object_name):
-    result = subprocess.run(
-        [sf_cli, "sobject", "describe", "--sobject-name", object_name, "--json", "--target-org", org],
-        capture_output=True, text=True, shell=True
-    )
-    return json.loads(result.stdout).get("fields", [])
+    data = run_sf_command([sf_cli, "force", "schema", "sobject", "describe", "-s", object_name, "--json", "--target-org", org])
+    return data.get("result", {}).get("fields", [])
 
 def mark_all_deleted():
     cur.execute("UPDATE SalesforceFields SET IsDeleted = 1")
-    cn.commit()
 
 def upsert_field(obj, name, label, dtype):
     now = datetime.utcnow()
+    label = label or ""
+    dtype = dtype or ""
+
+    # Try UPDATE first
     cur.execute("""
-    MERGE SalesforceFields AS target
-    USING (SELECT ? AS ObjectName, ? AS FieldName) AS src
-    ON target.ObjectName = src.ObjectName AND target.FieldName = src.FieldName
-    WHEN MATCHED THEN
-        UPDATE SET FieldLabel=?, DataType=?, LastSeen=?, IsDeleted=0
-    WHEN NOT MATCHED THEN
-        INSERT (ObjectName, FieldName, FieldLabel, DataType, LastSeen, IsDeleted)
-        VALUES (?, ?, ?, ?, ?, 0);
-    """, obj, name, label, dtype, now, obj, name, label, dtype, now)
-    cn.commit()
+        UPDATE SalesforceFields
+        SET FieldLabel=?, DataType=?, LastSeen=?, IsDeleted=0
+        WHERE ObjectName=? AND FieldName=?
+    """, (label, dtype, now, obj, name))
+
+    if cur.rowcount <= 0:
+        cur.execute("""
+            INSERT INTO SalesforceFields (ObjectName, FieldName, FieldLabel, DataType, LastSeen, IsDeleted)
+            VALUES (?, ?, ?, ?, ?, 0)
+        """, (obj, name, label, dtype, now))
+        print(f"   INSERT -> {obj}.{name} | Label={label} | Type={dtype}")
+    else:
+        print(f"   UPDATE -> {obj}.{name} | Label={label} | Type={dtype}")
 
 def main():
-    ensure_table()   # ✅ make sure table exists first
+    ensure_field_table()
+
+    # Sync fields
     mark_all_deleted()
     objects = get_objects()
     print(f"🔹 Found {len(objects)} objects")
 
-    for obj in objects:
-        print(f"⏳ Processing {obj}")
+    for idx, obj in enumerate(objects, start=1):
+        print(f"⏳ Processing {idx}/{len(objects)}: {obj}")
         fields = get_fields(obj)
+        if not fields:
+            print(f"⚠️ No fields returned for {obj}")
         for f in fields:
             name = f.get("name")
             label = f.get("label")
             dtype = f.get("type")
             upsert_field(obj, name, label, dtype)
 
-    print("✅ Sync complete")
+    print("✅ Field sync complete")
+
+    # Skip field dependencies for now
+    print("⚠️ Skipping MetadataComponentDependency (not available in this CLI).")
 
 if __name__ == "__main__":
     main()
