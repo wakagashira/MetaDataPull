@@ -1,11 +1,7 @@
 # Changelog
 
-## [0.2.1] - Sync Control Flags
-- Added SYNC_FIELDS and SYNC_USAGE flags in .env
-- Allows skipping field or usage sync for troubleshooting
-- Defaults to both true
-
-## [0.2.0] - Tooling API: Field Usage
-- Added Tooling API integration using the existing sf CLI auth
-- Syncs MetadataComponentDependency into SalesforceFieldUsage
-- requirements.txt now includes `requests`
+## [0.3.6] - Namespace-aware Flow Parsing
+- Added namespace detection for Flow XML files
+- All tag searches are now namespace-aware (sf:field, sf:leftValueReference, etc.)
+- Ensures fields are captured even when XML uses the Salesforce metadata namespace
+- DEBUG_FLOW_PARSE=true will now print matched tags + text correctly

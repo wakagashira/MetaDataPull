@@ -1,10 +1,12 @@
 import subprocess
-import json
 import pyodbc
 from datetime import datetime
 from dotenv import load_dotenv
 import os
-import requests
+import sys
+import xml.etree.ElementTree as ET
+import shutil
+import re
 
 # Load .env
 load_dotenv()
@@ -17,11 +19,8 @@ sql_user = os.getenv("SQL_USERNAME")
 sql_pwd = os.getenv("SQL_PASSWORD")
 org = os.getenv("SALESFORCE_ORG")
 sf_cli = os.getenv("SF_CLI", "sf.cmd")
-api_version = os.getenv("SF_API_VERSION", "61.0")
-
-# Control flags
-sync_fields = os.getenv("SYNC_FIELDS", "true").lower() == "true"
-sync_usage = os.getenv("SYNC_USAGE", "true").lower() == "true"
+keep_flow_xml = os.getenv("KEEP_FLOW_XML", "false").lower() == "true"
+debug_flow_parse = os.getenv("DEBUG_FLOW_PARSE", "false").lower() == "true"
 
 # SQL Connection (autocommit True for safety)
 cn = pyodbc.connect(
@@ -34,197 +33,130 @@ cn = pyodbc.connect(
 )
 cur = cn.cursor()
 
-def ensure_field_table():
+def ensure_flow_usage_table():
     cur.execute("""
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SalesforceFields' AND xtype='U')
-    CREATE TABLE SalesforceFields (
-        ObjectName NVARCHAR(255),
+    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SalesforceFlowFieldUsage' AND xtype='U')
+    CREATE TABLE SalesforceFlowFieldUsage (
+        FlowName NVARCHAR(255),
+        FlowStatus NVARCHAR(50),
         FieldName NVARCHAR(255),
-        FieldLabel NVARCHAR(255),
-        DataType NVARCHAR(255),
         LastSeen DATETIME NOT NULL,
-        LastUpdatedInSF DATETIME NULL,
-        IsDeleted BIT NOT NULL DEFAULT 0,
-        PRIMARY KEY (ObjectName, FieldName)
-    );
-    """)
-    try:
-        cur.execute("ALTER TABLE SalesforceFields ADD LastUpdatedInSF DATETIME NULL;")
-    except Exception:
-        pass
-
-def ensure_usage_table():
-    cur.execute("""
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='SalesforceFieldUsage' AND xtype='U')
-    CREATE TABLE SalesforceFieldUsage (
-        MetadataComponentType NVARCHAR(255),
-        MetadataComponentName NVARCHAR(255),
-        RefMetadataComponentType NVARCHAR(255),
-        RefMetadataComponentName NVARCHAR(255),
-        LastSeen DATETIME NOT NULL,
-        PRIMARY KEY (MetadataComponentType, MetadataComponentName, RefMetadataComponentName)
+        PRIMARY KEY (FlowName, FieldName)
     );
     """)
 
-def run_sf_command(cmd_args):
-    result = subprocess.run(cmd_args, capture_output=True, text=True, shell=True)
-    if result.returncode != 0:
-        print(f"⚠️ CLI command failed: {' '.join(cmd_args)}")
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
-        return {}
-    try:
-        return json.loads(result.stdout)
-    except Exception as e:
-        print("⚠️ Failed to parse JSON:", e)
-        print("Output was:", result.stdout[:500])
-        return {}
+def sync_flow_field_usage():
+    ensure_flow_usage_table()
 
-def get_objects():
-    data = run_sf_command([sf_cli, "force", "schema", "sobject", "list", "--json", "--target-org", org])
-    return data.get("result", [])
+    # Retrieve all flows via CLI
+    print("⏳ Retrieving flows via sf force source retrieve...")
+    subprocess.run([sf_cli, "force", "source", "retrieve", "-m", "Flow", "--json", "--target-org", org],
+                   capture_output=True, text=True, shell=True)
 
-def get_fields(object_name):
-    data = run_sf_command([sf_cli, "force", "schema", "sobject", "describe", "-s", object_name, "--json", "--target-org", org])
-    return data.get("result", {}).get("fields", [])
+    flow_dir = os.path.join("force-app", "main", "default", "flows")
+    if not os.path.exists(flow_dir):
+        print("⚠️ No flows retrieved.")
+        return
 
-def mark_all_deleted():
-    cur.execute("UPDATE SalesforceFields SET IsDeleted = 1")
-
-def upsert_field(obj, name, label, dtype):
     now = datetime.utcnow()
-    label = label or ""
-    dtype = dtype or ""
+    flow_files = [f for f in os.listdir(flow_dir) if f.endswith(".flow-meta.xml")]
+    print(f"🔹 Found {len(flow_files)} flow files to parse")    
 
+    field_pattern = re.compile(r"[A-Za-z0-9_]+\.[A-Za-z0-9_]+|[A-Za-z0-9_]+__c")    
+
+    for file in flow_files:
+        flow_path = os.path.join(flow_dir, file)
+        flow_name = file.replace(".flow-meta.xml", "")
+        flow_status = "Unknown"
+        try:
+            tree = ET.parse(flow_path)
+            root = tree.getroot()
+
+            # Detect namespace
+            ns = {}
+            if root.tag.startswith("{"):
+                uri = root.tag.split("}")[0].strip("{")
+                ns = {"sf": uri}
+
+            status_node = root.find("sf:status", ns) if ns else root.find("status")
+            if status_node is not None and status_node.text:
+                flow_status = status_node.text
+
+            refs = []
+
+            tags_to_check = [
+                "field",
+                "conditionField",
+                "leftValueReference",
+                "rightValueReference",
+                "inputAssignments/field",
+                "outputAssignments/field",
+                "assignmentItems/field",
+                "formula",
+                "value"
+            ]
+
+            for tag in tags_to_check:
+                path = f"sf:{tag}" if ns else tag
+                for node in root.findall(f".//{path}", ns):
+                    if node.text:
+                        if debug_flow_parse:
+                            print(f"[{flow_name}] {tag}: {node.text}")
+                        if tag in ["formula", "value"]:
+                            matches = field_pattern.findall(node.text)
+                            refs.extend(matches)
+                        else:
+                            refs.append(node.text)
+
+            refs = list(set(refs))  # Deduplicate
+
+            for field_name in refs:
+                cur.execute("""
+                    UPDATE SalesforceFlowFieldUsage
+                    SET FlowStatus=?, LastSeen=?
+                    WHERE FlowName=? AND FieldName=?
+                """, (flow_status, now, flow_name, field_name))
+
+                if cur.rowcount <= 0:
+                    cur.execute("""
+                        INSERT INTO SalesforceFlowFieldUsage
+                        (FlowName, FlowStatus, FieldName, LastSeen)
+                        VALUES (?, ?, ?, ?)
+                    """, (flow_name, flow_status, field_name, now))
+        except Exception as e:
+            print(f"⚠️ Failed to parse {file}: {e}")
+
+    if not keep_flow_xml:
+        shutil.rmtree(flow_dir, ignore_errors=True)
+        if not os.listdir(os.path.dirname(flow_dir)):
+            shutil.rmtree(os.path.dirname(flow_dir), ignore_errors=True)
+
+def report_flows():
     cur.execute("""
-        SELECT FieldLabel, DataType
-        FROM SalesforceFields
-        WHERE ObjectName=? AND FieldName=?
-    """, (obj, name))
-    row = cur.fetchone()
-
-    if row:
-        old_label, old_dtype = row
-        if old_label != label or old_dtype != dtype:
-            cur.execute("""
-                UPDATE SalesforceFields
-                SET FieldLabel=?, DataType=?, LastSeen=?, IsDeleted=0, LastUpdatedInSF=?
-                WHERE ObjectName=? AND FieldName=?
-            """, (label, dtype, now, now, obj, name))
-            print(f"   UPDATED -> {obj}.{name} | Label={label} | Type={dtype}")
-        else:
-            cur.execute("""
-                UPDATE SalesforceFields
-                SET LastSeen=?, IsDeleted=0
-                WHERE ObjectName=? AND FieldName=?
-            """, (now, obj, name))
-    else:
-        cur.execute("""
-            INSERT INTO SalesforceFields (ObjectName, FieldName, FieldLabel, DataType, LastSeen, LastUpdatedInSF, IsDeleted)
-            VALUES (?, ?, ?, ?, ?, ?, 0)
-        """, (obj, name, label, dtype, now, now))
-        print(f"   INSERT -> {obj}.{name} | Label={label} | Type={dtype}")
-
-def get_cli_auth():
-    data = run_sf_command([sf_cli, "org", "display", "--json", "--target-org", org])
-    result = data.get("result", {}) if data else {}
-    access_token = result.get("accessToken")
-    instance_url = result.get("instanceUrl")
-    if not access_token or not instance_url:
-        raise RuntimeError("Could not obtain access token/instance URL from Salesforce CLI.")
-    return access_token, instance_url
-
-def tooling_query_all(soql, access_token, instance_url):
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    url = f"{instance_url}/services/data/v{api_version}/tooling/query"
-    params = {"q": soql}
-    out = []
-
-    resp = requests.get(url, headers=headers, params=params)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Tooling API query failed: {resp.status_code} {resp.text}")
-    data = resp.json()
-    out.extend(data.get("records", []))
-
-    while data.get("done") is False and data.get("nextRecordsUrl"):
-        next_url = instance_url + data["nextRecordsUrl"]
-        resp = requests.get(next_url, headers=headers)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Tooling API next page failed: {resp.status_code} {resp.text}")
-        data = resp.json()
-        out.extend(data.get("records", []))
-
-    return out
-
-def sync_field_usage():
-    ensure_usage_table()
-    try:
-        access_token, instance_url = get_cli_auth()
-    except Exception as e:
-        print(f"⚠️ Skipping MetadataComponentDependency (auth error): {e}")
+        SELECT FlowName, FlowStatus, FieldName
+        FROM SalesforceFlowFieldUsage
+        ORDER BY FlowName, FieldName
+    """)
+    rows = cur.fetchall()
+    if not rows:
+        print("⚠️ No flow field usage data found. Run a sync first.")
         return
 
-    soql = (
-        "SELECT MetadataComponentName, MetadataComponentType, "
-        "RefMetadataComponentName, RefMetadataComponentType "
-        "FROM MetadataComponentDependency"
-    )
-    try:
-        records = tooling_query_all(soql, access_token, instance_url)
-    except Exception as e:
-        print(f"⚠️ Skipping MetadataComponentDependency (query error): {e}")
-        return
-
-    print(f"🔹 Found {len(records)} field usage dependencies")    
-
-    now = datetime.utcnow()
-    for r in records:
-        mtype = r.get("MetadataComponentType") or ""
-        mname = r.get("MetadataComponentName") or ""
-        rtype = r.get("RefMetadataComponentType") or ""
-        rname = r.get("RefMetadataComponentName") or ""
-
-        cur.execute("""
-            UPDATE SalesforceFieldUsage
-            SET RefMetadataComponentType=?, LastSeen=?
-            WHERE MetadataComponentType=? AND MetadataComponentName=? AND RefMetadataComponentName=?
-        """, (rtype, now, mtype, mname, rname))
-
-        if cur.rowcount <= 0:
-            cur.execute("""
-                INSERT INTO SalesforceFieldUsage
-                (MetadataComponentType, MetadataComponentName, RefMetadataComponentType, RefMetadataComponentName, LastSeen)
-                VALUES (?, ?, ?, ?, ?)
-            """, (mtype, mname, rtype, rname, now))
+    print("🔹 Fields used in Flows:")
+    current_flow = None
+    for flow_name, flow_status, field_name in rows:
+        if flow_name != current_flow:
+            print(f"Flow: {flow_name} ({flow_status})")
+            current_flow = flow_name
+        print(f"   - {field_name}")
 
 def main():
-    ensure_field_table()
-    ensure_usage_table()
+    if len(sys.argv) > 1 and sys.argv[1] == "--report" and len(sys.argv) > 2 and sys.argv[2] == "flows":
+        report_flows()
+        return
 
-    if sync_fields:
-        mark_all_deleted()
-        objects = get_objects()
-        print(f"🔹 Found {len(objects)} objects")    
-
-        for idx, obj in enumerate(objects, start=1):
-            print(f"⏳ Processing {idx}/{len(objects)}: {obj}")
-            fields = get_fields(obj)
-            if not fields:
-                print(f"⚠️ No fields returned for {obj}")
-            for f in fields:
-                name = f.get("name")
-                label = f.get("label")
-                dtype = f.get("type")
-                upsert_field(obj, name, label, dtype)
-        print("✅ Field sync complete")
-    else:
-        print("⚠️ Skipping field sync (SYNC_FIELDS=false)")
-
-    if sync_usage:
-        sync_field_usage()
-        print("✅ Field usage sync complete")
-    else:
-        print("⚠️ Skipping field usage sync (SYNC_USAGE=false)")
+    sync_flow_field_usage()
+    print("✅ Flow field usage sync complete")    
 
 if __name__ == "__main__":
     main()
