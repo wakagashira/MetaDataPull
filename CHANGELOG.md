@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2] - SQL Change Tracking
+- Added `LastUpdatedInSF` column to SalesforceFields
+- Only updates SQL row if label/type changed, otherwise just updates LastSeen
+- New fields set `LastUpdatedInSF = GETUTCDATE()`
+- Prevents unnecessary updates for unchanged fields
+
 ## [0.1.1] - First Minor Release
 - Promoted from 0.0.x to 0.1.x to mark stable field syncing functionality
 - Includes fixes for `sf force schema` commands and correct JSON parsing

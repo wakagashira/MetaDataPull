@@ -15,7 +15,7 @@ sql_db = os.getenv("SQL_DATABASE")
 sql_user = os.getenv("SQL_USERNAME")
 sql_pwd = os.getenv("SQL_PASSWORD")
 org = os.getenv("SALESFORCE_ORG")
-sf_cli = os.getenv("SF_CLI", "sf.cmd")  # Default to sf.cmd on Windows
+sf_cli = os.getenv("SF_CLI", "sf.cmd")
 
 # SQL Connection (autocommit True for safety)
 cn = pyodbc.connect(
@@ -37,10 +37,16 @@ def ensure_field_table():
         FieldLabel NVARCHAR(255),
         DataType NVARCHAR(255),
         LastSeen DATETIME NOT NULL,
+        LastUpdatedInSF DATETIME NULL,
         IsDeleted BIT NOT NULL DEFAULT 0,
         PRIMARY KEY (ObjectName, FieldName)
     );
     """)
+    # Ensure LastUpdatedInSF column exists
+    try:
+        cur.execute("ALTER TABLE SalesforceFields ADD LastUpdatedInSF DATETIME NULL;")
+    except Exception:
+        pass
 
 def run_sf_command(cmd_args):
     result = subprocess.run(cmd_args, capture_output=True, text=True, shell=True)
@@ -72,26 +78,39 @@ def upsert_field(obj, name, label, dtype):
     label = label or ""
     dtype = dtype or ""
 
-    # Try UPDATE first
+    # Check if field exists
     cur.execute("""
-        UPDATE SalesforceFields
-        SET FieldLabel=?, DataType=?, LastSeen=?, IsDeleted=0
+        SELECT FieldLabel, DataType
+        FROM SalesforceFields
         WHERE ObjectName=? AND FieldName=?
-    """, (label, dtype, now, obj, name))
+    """, (obj, name))
+    row = cur.fetchone()
 
-    if cur.rowcount <= 0:
-        cur.execute("""
-            INSERT INTO SalesforceFields (ObjectName, FieldName, FieldLabel, DataType, LastSeen, IsDeleted)
-            VALUES (?, ?, ?, ?, ?, 0)
-        """, (obj, name, label, dtype, now))
-        print(f"   INSERT -> {obj}.{name} | Label={label} | Type={dtype}")
+    if row:
+        old_label, old_dtype = row
+        if old_label != label or old_dtype != dtype:
+            cur.execute("""
+                UPDATE SalesforceFields
+                SET FieldLabel=?, DataType=?, LastSeen=?, IsDeleted=0, LastUpdatedInSF=?
+                WHERE ObjectName=? AND FieldName=?
+            """, (label, dtype, now, now, obj, name))
+            print(f"   UPDATED -> {obj}.{name} | Label={label} | Type={dtype}")
+        else:
+            cur.execute("""
+                UPDATE SalesforceFields
+                SET LastSeen=?, IsDeleted=0
+                WHERE ObjectName=? AND FieldName=?
+            """, (now, obj, name))
     else:
-        print(f"   UPDATE -> {obj}.{name} | Label={label} | Type={dtype}")
+        cur.execute("""
+            INSERT INTO SalesforceFields (ObjectName, FieldName, FieldLabel, DataType, LastSeen, LastUpdatedInSF, IsDeleted)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+        """, (obj, name, label, dtype, now, now))
+        print(f"   INSERT -> {obj}.{name} | Label={label} | Type={dtype}")
 
 def main():
     ensure_field_table()
 
-    # Sync fields
     mark_all_deleted()
     objects = get_objects()
     print(f"🔹 Found {len(objects)} objects")
@@ -108,8 +127,6 @@ def main():
             upsert_field(obj, name, label, dtype)
 
     print("✅ Field sync complete")
-
-    # Skip field dependencies for now
     print("⚠️ Skipping MetadataComponentDependency (not available in this CLI).")
 
 if __name__ == "__main__":
