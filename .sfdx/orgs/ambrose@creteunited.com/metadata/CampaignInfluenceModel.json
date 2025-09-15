@@ -1,0 +1,18 @@
+{
+  "status": 0,
+  "result": [
+    {
+      "createdById": "0054x000001juCoAAI",
+      "createdByName": "Martin Katz",
+      "createdDate": "2020-12-22T16:06:02.000Z",
+      "fileName": "campaignInfluenceModels/primaryModel.campaignInfluenceModel",
+      "fullName": "primaryModel",
+      "id": "03V4x00000003NwEAI",
+      "lastModifiedById": "0054x000001juCoAAI",
+      "lastModifiedByName": "Martin Katz",
+      "lastModifiedDate": "2020-12-22T16:06:02.000Z",
+      "manageableState": "unmanaged",
+      "type": "CampaignInfluenceModel"
+    }
+  ]
+}
