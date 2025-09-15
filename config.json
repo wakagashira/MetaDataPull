@@ -1,0 +1,10 @@
+{
+  "sql": {
+    "driver": "{ODBC Driver 17 for SQL Server}",
+    "server": "localhost",
+    "database": "SalesforceMeta",
+    "username": "your_user",
+    "password": "your_password"
+  },
+  "salesforce_org": "MyOrg"
+}
